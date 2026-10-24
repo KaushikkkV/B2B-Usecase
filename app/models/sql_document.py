@@ -34,6 +34,7 @@ class SQLDocument(Base):
     wrapped_dek: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     encryption_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
     auth_tag: Mapped[bytes | None] = mapped_column(LargeBinary(16), nullable=True)
+    key_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

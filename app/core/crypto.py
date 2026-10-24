@@ -31,7 +31,7 @@ class CryptoVaultService:
         if len(self.master_key) < 32:
             raise ValueError("Master key must be at least 32 bytes (256 bits) for cryptographic security.")
 
-    def _derive_tenant_kek(self, org_id: str) -> bytes:
+    def _derive_tenant_kek(self, org_id: str, key_material: bytes | None = None) -> bytes:
         """Derive a deterministic, tenant-isolated 256-bit KEK using HKDF-SHA256."""
         hkdf = HKDF(
             algorithm=hashes.SHA256(),
@@ -39,7 +39,7 @@ class CryptoVaultService:
             salt=b"b2b-vault-tenant-kek-salt-v1",
             info=f"tenant-kek:{org_id}".encode(),
         )
-        return hkdf.derive(self.master_key)
+        return hkdf.derive(key_material or self.master_key)
 
     def encrypt_document(
         self,
@@ -113,3 +113,48 @@ class CryptoVaultService:
             raise EncryptionError("Cryptographic integrity verification failed. Data may be tampered.") from exc
         except Exception as exc:
             raise EncryptionError(f"Decryption failed: {exc}") from exc
+
+    def rewrap_dek(
+        self,
+        org_id: str,
+        wrapped_dek: bytes,
+        new_master_key: str | bytes,
+    ) -> bytes:
+        """
+        Zero-plaintext DEK re-wrapping for master key rotation.
+        Unwraps the ephemeral DEK using the existing KEK and wraps it under
+        the new master key with a fresh nonce without decrypting document ciphertext.
+        """
+        if len(wrapped_dek) < 28:
+            raise EncryptionError("Invalid wrapped DEK structure")
+
+        resolved_new_key: bytes = (
+            new_master_key.encode("utf-8")
+            if isinstance(new_master_key, str)
+            else new_master_key
+        )
+        if len(resolved_new_key) < 32:
+            raise ValueError("New master key must be at least 32 bytes (256 bits).")
+
+        try:
+            # 1. Unwrap DEK using old KEK
+            old_kek = self._derive_tenant_kek(org_id)
+            old_kek_gcm = AESGCM(old_kek)
+            aad = f"vault-doc:{org_id}".encode()
+
+            old_nonce = wrapped_dek[:12]
+            old_wrapped_payload = wrapped_dek[12:]
+            raw_dek = old_kek_gcm.decrypt(old_nonce, old_wrapped_payload, aad)
+
+            # 2. Re-wrap raw DEK under new KEK with a new nonce
+            new_kek = self._derive_tenant_kek(org_id, key_material=resolved_new_key)
+            new_kek_gcm = AESGCM(new_kek)
+            new_nonce = os.urandom(12)
+            new_wrapped_payload = new_kek_gcm.encrypt(new_nonce, raw_dek, aad)
+
+            return new_nonce + new_wrapped_payload
+
+        except (InvalidTag, InvalidSignature) as exc:
+            raise EncryptionError("Failed to unwrap DEK under current master key") from exc
+        except Exception as exc:
+            raise EncryptionError(f"DEK re-wrap operation failed: {exc}") from exc
