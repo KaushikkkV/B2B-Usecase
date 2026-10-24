@@ -39,6 +39,15 @@ class SQLDocumentRepository:
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
+    async def get_by_id_system(
+        self,
+        doc_id: str,
+    ) -> DocumentRequestModel | None:
+        """System-level retrieval for trusted internal workers and scanner webhooks."""
+        query = select(DocumentRequestModel).where(DocumentRequestModel.id == doc_id)
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+
     async def update_status(
         self,
         doc_id: str,
