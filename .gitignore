@@ -27,3 +27,8 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+
+.vault_storage/
+.pytest_cache/
+__pycache__/
+*.enc

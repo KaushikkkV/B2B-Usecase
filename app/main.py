@@ -1,81 +1,54 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.api.deps import RequireRoles, check_tenant_rate_limit
+from app.api.v1.admin import router as admin_router
 from app.api.v1.documents import router as doc_router
 from app.api.v1.webhooks import router as webhook_router
-from app.core.database import engine
+from app.core.database import AsyncSessionLocal, init_db
 from app.core.logging import ObservabilityMiddleware
-from app.schemas.auth import AuthenticatedUser, UserRole
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    await init_db()
     yield
 
 
 app = FastAPI(
-    title="B2B Secure Document Vault",
+    title="Secure B2B Document Vault",
+    description="Enterprise cryptographic document pipeline with zero-trust envelope encryption.",
     version="1.0.0",
-    docs_url="/api/docs",
-    openapi_url="/api/openapi.json",
     lifespan=lifespan,
 )
 
 app.add_middleware(ObservabilityMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(doc_router)
 app.include_router(webhook_router)
+app.include_router(admin_router)
 
 
-@app.get("/healthz", status_code=status.HTTP_200_OK, tags=["Health"])
-async def healthcheck() -> dict[str, str]:
+@app.get("/healthz", tags=["System"])
+async def health_check() -> dict[str, str]:
     return {"status": "ok", "service": "b2b-document-vault"}
 
 
-@app.get("/readyz", status_code=status.HTTP_200_OK, tags=["Health"])
+@app.get("/readyz", tags=["System"])
 async def readiness_check() -> dict[str, str]:
     try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1"))
         return {"status": "ready", "database": "connected"}
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Database connectivity check failed: {exc}",
-        ) from exc
-
-
-@app.get(
-    "/api/v1/documents",
-    status_code=status.HTTP_200_OK,
-    tags=["Documents"],
-    dependencies=[Depends(check_tenant_rate_limit)],
-)
-async def list_documents(
-    current_user: AuthenticatedUser = Depends(
-        RequireRoles([UserRole.ORG_ADMIN, UserRole.CASE_MANAGER, UserRole.CLIENT])
-    ),
-) -> dict[str, str]:
-    return {
-        "status": "success",
-        "org_id": current_user.org_id,
-        "user_id": current_user.user_id,
-        "role": current_user.role.value,
-    }
-
-
-@app.get("/api/v1/organization/settings", status_code=status.HTTP_200_OK, tags=["Admin"])
-async def organization_settings(
-    current_user: AuthenticatedUser = Depends(
-        RequireRoles([UserRole.ORG_ADMIN])
-    ),
-) -> dict[str, str]:
-    return {
-        "status": "success",
-        "org_id": current_user.org_id,
-        "message": "Admin settings loaded",
-    }
+        return {"status": "unhealthy", "error": str(exc)}

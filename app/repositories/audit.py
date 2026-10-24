@@ -1,9 +1,7 @@
-from collections.abc import Sequence
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.audit import AuditLogModel
+from app.models.audit import AuditEventModel
 
 
 class AuditRepository:
@@ -13,12 +11,12 @@ class AuditRepository:
     async def log_event(
         self,
         org_id: str,
-        document_id: str,
+        document_id: str | None,
         actor_id: str,
         action: str,
-        details: str = "",
-    ) -> AuditLogModel:
-        event = AuditLogModel(
+        details: str,
+    ) -> AuditEventModel:
+        event = AuditEventModel(
             org_id=org_id,
             document_id=document_id,
             actor_id=actor_id,
@@ -26,21 +24,18 @@ class AuditRepository:
             details=details,
         )
         self.session.add(event)
-        await self.session.flush()
+        await self.session.commit()
+        await self.session.refresh(event)
         return event
 
-    async def get_by_document(
-        self,
-        document_id: str,
-        org_id: str,
-    ) -> Sequence[AuditLogModel]:
+    async def get_by_document(self, document_id: str, org_id: str) -> list[AuditEventModel]:
         stmt = (
-            select(AuditLogModel)
+            select(AuditEventModel)
             .where(
-                AuditLogModel.document_id == document_id,
-                AuditLogModel.org_id == org_id,
+                AuditEventModel.document_id == document_id,
+                AuditEventModel.org_id == org_id,
             )
-            .order_by(AuditLogModel.created_at.asc())
+            .order_by(AuditEventModel.timestamp.asc())
         )
         result = await self.session.execute(stmt)
-        return result.scalars().all()
+        return list(result.scalars().all())
