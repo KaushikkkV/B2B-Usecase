@@ -1,68 +1,101 @@
+from collections.abc import Sequence
+
 import jwt
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, HTTPException, Request, Response, status
 from pydantic import ValidationError
 
+from app.core.rate_limit import default_rate_limiter
 from app.core.security import decode_access_token
 from app.schemas.auth import AuthenticatedUser, UserRole
 
-MAX_TOKEN_LENGTH_BYTES = 4096
-bearer_scheme = HTTPBearer(auto_error=False)
+MAX_TOKEN_LENGTH: int = 4096
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-) -> AuthenticatedUser:
-    if not credentials or not credentials.credentials:
+async def get_current_user(request: Request) -> AuthenticatedUser:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Missing Authorization header",
         )
 
-    raw_token = credentials.credentials.strip()
-    if len(raw_token.encode("utf-8")) > MAX_TOKEN_LENGTH_BYTES:
+    # Defend against oversized header / memory exhaustion bombs
+    if len(auth_header) > MAX_TOKEN_LENGTH:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token exceeds maximum permitted size",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Authorization header exceeds allowable length",
         )
 
+    parts = auth_header.split(" ")
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid Authorization header format. Expected 'Bearer <token>'",
+        )
+
+    token = parts[1]
+    if not token or len(token) > MAX_TOKEN_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or truncated token",
+        )
+
+    # Verify signature and decode claims
     try:
-        payload = decode_access_token(raw_token)
-        user_id = payload.get("sub")
-        org_id = payload.get("org_id")
-        role_str = payload.get("role")
-
-        if not user_id or not org_id or not role_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Malformed token claims",
-            )
-
-        role = UserRole(role_str)
-        return AuthenticatedUser(user_id=user_id, org_id=org_id, role=role)
-
-    except (jwt.PyJWTError, ValueError, ValidationError) as err:
+        claims = decode_access_token(token)
+    except jwt.PyJWTError as err:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail=f"Invalid or expired token: {err}",
+        ) from err
+
+    # Ensure all required claims are present
+    if not all(k in claims for k in ("sub", "org_id", "role")):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing required claims",
+        )
+
+    # Validate role enum and schema constraints (including injection pattern guards)
+    try:
+        role = UserRole(claims["role"])
+        return AuthenticatedUser(
+            user_id=claims["sub"],
+            org_id=claims["org_id"],
+            role=role,
+        )
+    except (ValueError, KeyError, ValidationError) as err:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token claims failed schema validation",
         ) from err
 
 
 class RequireRoles:
-    """RBAC dependency to restrict endpoints to specific roles."""
+    def __init__(self, allowed_roles: Sequence[UserRole]) -> None:
+        self.allowed_roles = set(allowed_roles)
 
-    def __init__(self, allowed_roles: list[UserRole]) -> None:
-        self.allowed_roles = allowed_roles
-
-    def __call__(
-        self, current_user: AuthenticatedUser = Depends(get_current_user)
+    async def __call__(
+        self,
+        current_user: AuthenticatedUser = Depends(get_current_user),
     ) -> AuthenticatedUser:
         if current_user.role not in self.allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Operation not permitted for current role",
+                detail=f"Role '{current_user.role.value}' lacks required permissions",
             )
         return current_user
+
+
+async def check_tenant_rate_limit(
+    response: Response,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> None:
+    allowed, retry_after = default_rate_limiter.is_allowed(current_user.org_id)
+    if not allowed:
+        response.headers["Retry-After"] = str(retry_after)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too Many Requests: Tenant rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )

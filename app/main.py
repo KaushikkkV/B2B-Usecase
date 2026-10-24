@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, status
 
-from app.api.deps import RequireRoles
+from app.api.deps import RequireRoles, check_tenant_rate_limit
 from app.api.v1.documents import router as doc_router
 from app.api.v1.webhooks import router as webhook_router
 from app.core.database import init_db
@@ -33,7 +33,12 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok", "service": "b2b-document-vault"}
 
 
-@app.get("/api/v1/documents", status_code=status.HTTP_200_OK, tags=["Documents"])
+@app.get(
+    "/api/v1/documents",
+    status_code=status.HTTP_200_OK,
+    tags=["Documents"],
+    dependencies=[Depends(check_tenant_rate_limit)],
+)
 async def list_documents(
     current_user: AuthenticatedUser = Depends(
         RequireRoles([UserRole.ORG_ADMIN, UserRole.CASE_MANAGER, UserRole.CLIENT])
