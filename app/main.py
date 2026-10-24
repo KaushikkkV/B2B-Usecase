@@ -6,12 +6,12 @@ from fastapi import Depends, FastAPI, status
 from app.api.deps import RequireRoles, check_tenant_rate_limit
 from app.api.v1.documents import router as doc_router
 from app.api.v1.webhooks import router as webhook_router
+from app.core.logging import ObservabilityMiddleware
 from app.schemas.auth import AuthenticatedUser, UserRole
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    # Production pattern: schema lifecycle is driven by Alembic CLI/CI pipelines
     yield
 
 
@@ -22,6 +22,8 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
     lifespan=lifespan,
 )
+
+app.add_middleware(ObservabilityMiddleware)
 
 app.include_router(doc_router)
 app.include_router(webhook_router)
