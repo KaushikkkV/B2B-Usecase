@@ -1,6 +1,7 @@
 from fastapi import Depends, FastAPI, status
 
 from app.api.deps import RequireRoles
+from app.api.v1.documents import router as doc_router
 from app.schemas.auth import AuthenticatedUser, UserRole
 
 app = FastAPI(
@@ -9,6 +10,8 @@ app = FastAPI(
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
 )
+
+app.include_router(doc_router)
 
 
 @app.get("/healthz", status_code=status.HTTP_200_OK, tags=["Health"])
@@ -32,7 +35,9 @@ async def list_documents(
 
 @app.get("/api/v1/organization/settings", status_code=status.HTTP_200_OK, tags=["Admin"])
 async def organization_settings(
-    current_user: AuthenticatedUser = Depends(RequireRoles([UserRole.ORG_ADMIN])),
+    current_user: AuthenticatedUser = Depends(
+        RequireRoles([UserRole.ORG_ADMIN])
+    ),
 ) -> dict[str, str]:
     return {
         "status": "success",

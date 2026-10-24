@@ -38,7 +38,7 @@ async def test_exploit_forged_signature_with_arbitrary_key():
     ATTACK: An attacker signs a token using their own rogue secret key.
     The server must reject it because the signature is invalid.
     """
-    rogue_key = "rogue-secret-attacker-key-12345"
+    rogue_key = "rogue-secret-attacker-key-1234567890"
     malicious_payload = {
         "sub": "rogue-agent",
         "org_id": "org-victim-999",
