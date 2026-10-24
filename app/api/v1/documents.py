@@ -1,7 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import RequireRoles, get_current_user
+from app.core.crypto import CryptoVaultService, EncryptionError
 from app.core.database import get_db_session
 from app.core.storage import StorageValidationError, storage_service
 from app.models.document import DocumentRequest, DocumentRequestStateError, DocumentStatus
@@ -17,11 +20,14 @@ from app.schemas.document import (
 )
 from app.schemas.storage import PresignedUploadRequest, PresignedUploadResponse
 
-router = APIRouter(prefix="/api/v1/document-requests", tags=["Document Requests"])
+router = APIRouter(prefix="/api/v1", tags=["Documents"])
+crypto_vault = CryptoVaultService()
+STORAGE_DIR = Path("./.vault_storage")
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @router.post(
-    "",
+    "/document-requests",
     response_model=DocumentRequestResponse,
     status_code=status.HTTP_201_CREATED,
 )
@@ -53,7 +59,7 @@ async def create_document_request(
 
 
 @router.post(
-    "/{doc_id}/upload-url",
+    "/document-requests/{doc_id}/upload-url",
     response_model=PresignedUploadResponse,
     status_code=status.HTTP_200_OK,
 )
@@ -105,8 +111,161 @@ async def get_presigned_upload_url(
         ) from err
 
 
+@router.post(
+    "/documents/{doc_id}/upload-direct",
+    status_code=status.HTTP_200_OK,
+)
+async def upload_direct_encrypted_document(
+    doc_id: str,
+    file: UploadFile,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, str]:
+    repo = SQLDocumentRepository(db)
+    audit_repo = AuditRepository(db)
+
+    doc = await repo.get_by_id(doc_id=doc_id, org_id=current_user.org_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document request not found",
+        )
+
+    if current_user.role == UserRole.CLIENT and doc.client_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot upload documents assigned to another client",
+        )
+
+    raw_bytes = await file.read()
+    if len(raw_bytes) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File cannot be empty",
+        )
+
+    # 1. Envelope Encrypt payload using per-tenant KEK and fresh DEK
+    ciphertext, wrapped_dek, nonce, tag = crypto_vault.encrypt_document(
+        org_id=doc.org_id,
+        plaintext=raw_bytes,
+    )
+
+    # 2. Persist encrypted bytes to isolated storage
+    storage_filename = f"{doc.org_id}_{doc.id}.enc"
+    storage_path = STORAGE_DIR / storage_filename
+    storage_path.write_bytes(ciphertext)
+
+    # 3. Update database record with cryptographic metadata
+    doc.file_name = file.filename
+    doc.file_size_bytes = len(raw_bytes)
+    doc.mime_type = file.content_type
+    doc.storage_key = str(storage_path)
+    doc.status = DocumentStatus.UPLOADED
+    doc.wrapped_dek = wrapped_dek
+    doc.encryption_nonce = nonce
+    doc.auth_tag = tag
+
+    await db.commit()
+    await db.refresh(doc)
+
+    await audit_repo.log_event(
+        org_id=current_user.org_id,
+        document_id=doc.id,
+        actor_id=current_user.user_id,
+        action="DOCUMENT_ENCRYPTED_AND_UPLOADED",
+        details=f"Ciphertext size: {len(ciphertext)} bytes",
+    )
+
+    return {"status": "success", "document_id": doc.id}
+
+
 @router.get(
-    "/{doc_id}/download-url",
+    "/documents/{doc_id}/download-decrypted",
+    status_code=status.HTTP_200_OK,
+)
+async def download_decrypted_document(
+    doc_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> Response:
+    repo = SQLDocumentRepository(db)
+    audit_repo = AuditRepository(db)
+
+    doc = await repo.get_by_id(doc_id=doc_id, org_id=current_user.org_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document request not found",
+        )
+
+    if current_user.role == UserRole.CLIENT and doc.client_id != current_user.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot download documents assigned to another client",
+        )
+
+    if doc.is_infected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: file is quarantined as malware",
+        )
+
+    if doc.status != DocumentStatus.APPROVED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot download unapproved document in state {doc.status.value}",
+        )
+
+    if not (doc.wrapped_dek and doc.encryption_nonce and doc.auth_tag and doc.storage_key):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document cryptographic materials are missing or corrupted",
+        )
+
+    file_path = Path(doc.storage_key)
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Encrypted storage object missing",
+        )
+
+    ciphertext = file_path.read_bytes()
+
+    try:
+        decrypted = crypto_vault.decrypt_document(
+            org_id=doc.org_id,
+            ciphertext=ciphertext,
+            wrapped_dek=doc.wrapped_dek,
+            nonce=doc.encryption_nonce,
+            tag=doc.auth_tag,
+        )
+    except EncryptionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cryptographic verification failed: document tampered or invalid key",
+        ) from exc
+
+    await audit_repo.log_event(
+        org_id=current_user.org_id,
+        document_id=doc.id,
+        actor_id=current_user.user_id,
+        action="DOCUMENT_DECRYPTED_AND_DOWNLOADED",
+        details=f"Document title: {doc.title}",
+    )
+
+    download_name = doc.file_name or f"{doc.title}.pdf"
+    return Response(
+        content=decrypted,
+        media_type=doc.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{download_name}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get(
+    "/document-requests/{doc_id}/download-url",
     status_code=status.HTTP_200_OK,
 )
 async def get_presigned_download_url(
@@ -130,7 +289,6 @@ async def get_presigned_download_url(
             detail="Cannot download documents assigned to another client",
         )
 
-    # Document must be at least UPLOADED or APPROVED to download
     if doc.status not in (DocumentStatus.UPLOADED, DocumentStatus.APPROVED):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -155,7 +313,7 @@ async def get_presigned_download_url(
 
 
 @router.get(
-    "/{doc_id}/audit-trail",
+    "/document-requests/{doc_id}/audit-trail",
     response_model=list[AuditEventResponse],
     status_code=status.HTTP_200_OK,
 )
@@ -181,7 +339,7 @@ async def get_audit_trail(
 
 
 @router.patch(
-    "/{doc_id}/status",
+    "/document-requests/{doc_id}/status",
     response_model=DocumentRequestResponse,
     status_code=status.HTTP_200_OK,
 )
