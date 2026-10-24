@@ -1,16 +1,15 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Index, String
-from sqlalchemy import Enum as SQLEnum
+from sqlalchemy import DateTime, Enum, Index, Integer, LargeBinary, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 from app.models.document import DocumentStatus
 
 
-class DocumentRequestModel(Base):
-    __tablename__ = "document_requests"
+class SQLDocument(Base):
+    __tablename__ = "documents"
 
     id: Mapped[str] = mapped_column(
         String(36),
@@ -20,11 +19,22 @@ class DocumentRequestModel(Base):
     org_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     client_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    storage_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     status: Mapped[DocumentStatus] = mapped_column(
-        SQLEnum(DocumentStatus, native_enum=False),
-        nullable=False,
+        Enum(DocumentStatus),
         default=DocumentStatus.PENDING,
+        nullable=False,
     )
+    is_infected: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+    # Envelope Encryption Artifacts (AES-256-GCM)
+    wrapped_dek: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    encryption_nonce: Mapped[bytes | None] = mapped_column(LargeBinary(12), nullable=True)
+    auth_tag: Mapped[bytes | None] = mapped_column(LargeBinary(16), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -38,5 +48,10 @@ class DocumentRequestModel(Base):
     )
 
     __table_args__ = (
-        Index("ix_doc_org_id_id", "org_id", "id"),
+        Index("ix_documents_org_id_id", "org_id", "id"),
+        Index("ix_documents_org_id_client_id", "org_id", "client_id"),
     )
+
+
+# Alias for backward-compatibility with repositories and API endpoints
+DocumentRequestModel = SQLDocument
