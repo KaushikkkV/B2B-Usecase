@@ -1,11 +1,13 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, status
+from fastapi import Depends, FastAPI, HTTPException, status
+from sqlalchemy import text
 
 from app.api.deps import RequireRoles, check_tenant_rate_limit
 from app.api.v1.documents import router as doc_router
 from app.api.v1.webhooks import router as webhook_router
+from app.core.database import engine
 from app.core.logging import ObservabilityMiddleware
 from app.schemas.auth import AuthenticatedUser, UserRole
 
@@ -17,7 +19,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(
     title="B2B Secure Document Vault",
-    version="0.1.0",
+    version="1.0.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
     lifespan=lifespan,
@@ -32,6 +34,19 @@ app.include_router(webhook_router)
 @app.get("/healthz", status_code=status.HTTP_200_OK, tags=["Health"])
 async def healthcheck() -> dict[str, str]:
     return {"status": "ok", "service": "b2b-document-vault"}
+
+
+@app.get("/readyz", status_code=status.HTTP_200_OK, tags=["Health"])
+async def readiness_check() -> dict[str, str]:
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return {"status": "ready", "database": "connected"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database connectivity check failed: {exc}",
+        ) from exc
 
 
 @app.get(

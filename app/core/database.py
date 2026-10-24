@@ -1,16 +1,16 @@
+import os
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import declarative_base
 
-DATABASE_URL = "sqlite+aiosqlite:///./test_vault.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./vault.db")
 
-engine: AsyncEngine = create_async_engine(
+engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
@@ -18,24 +18,20 @@ engine: AsyncEngine = create_async_engine(
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
+    autocommit=False,
     autoflush=False,
+    expire_on_commit=False,
 )
 
-
-class Base(DeclarativeBase):
-    pass
+Base = declarative_base()
 
 
 async def init_db() -> None:
-    """Create all database tables on startup or test setup."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency that yields a scoped asynchronous database session."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -43,3 +39,7 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
+
+
+# Alias for dependency injection compatibility
+get_db = get_db_session
