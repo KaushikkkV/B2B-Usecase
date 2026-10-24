@@ -19,7 +19,6 @@ async def get_current_user(request: Request) -> AuthenticatedUser:
             detail="Missing Authorization header",
         )
 
-    # Defend against oversized header / memory exhaustion bombs
     if len(auth_header) > MAX_TOKEN_LENGTH:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -40,7 +39,6 @@ async def get_current_user(request: Request) -> AuthenticatedUser:
             detail="Invalid or truncated token",
         )
 
-    # Verify signature and decode claims
     try:
         claims = decode_access_token(token)
     except jwt.PyJWTError as err:
@@ -49,14 +47,12 @@ async def get_current_user(request: Request) -> AuthenticatedUser:
             detail=f"Invalid or expired token: {err}",
         ) from err
 
-    # Ensure all required claims are present
     if not all(k in claims for k in ("sub", "org_id", "role")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token missing required claims",
         )
 
-    # Validate role enum and schema constraints (including injection pattern guards)
     try:
         role = UserRole(claims["role"])
         return AuthenticatedUser(
@@ -91,7 +87,7 @@ async def check_tenant_rate_limit(
     response: Response,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> None:
-    allowed, retry_after = default_rate_limiter.is_allowed(current_user.org_id)
+    allowed, retry_after = await default_rate_limiter.is_allowed(current_user.org_id)
     if not allowed:
         response.headers["Retry-After"] = str(retry_after)
         raise HTTPException(
