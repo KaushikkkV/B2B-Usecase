@@ -6,13 +6,12 @@ from fastapi import Depends, FastAPI, status
 from app.api.deps import RequireRoles, check_tenant_rate_limit
 from app.api.v1.documents import router as doc_router
 from app.api.v1.webhooks import router as webhook_router
-from app.core.database import init_db
 from app.schemas.auth import AuthenticatedUser, UserRole
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    await init_db()
+    # Production pattern: schema lifecycle is driven by Alembic CLI/CI pipelines
     yield
 
 
