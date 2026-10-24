@@ -1,11 +1,11 @@
 from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import RequireRoles, get_current_user
 from app.core.crypto import CryptoVaultService, EncryptionError
 from app.core.database import get_db_session
+from app.core.rate_limit import rate_limiter
 from app.core.storage import StorageValidationError, storage_service
 from app.models.document import DocumentRequest, DocumentRequestStateError, DocumentStatus
 from app.models.sql_document import DocumentRequestModel
@@ -26,6 +26,41 @@ STORAGE_DIR = Path("./.vault_storage")
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+@router.get(
+    "/documents",
+    status_code=status.HTTP_200_OK,
+)
+async def list_documents(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, list[DocumentRequestResponse] | str]:
+    await rate_limiter.check_rate_limit(current_user.org_id)
+    repo = SQLDocumentRepository(db)
+    docs = await repo.list_by_org(org_id=current_user.org_id)
+    if current_user.role == UserRole.CLIENT:
+        docs = [d for d in docs if d.client_id == current_user.user_id]
+    return {
+        "user_id": current_user.user_id,
+        "org_id": current_user.org_id,
+        "documents": [DocumentRequestResponse.model_validate(d) for d in docs],
+    }
+
+
+@router.get(
+    "/organization/settings",
+    status_code=status.HTTP_200_OK,
+)
+async def get_organization_settings(
+    current_user: AuthenticatedUser = Depends(RequireRoles([UserRole.ORG_ADMIN])),
+) -> dict[str, str]:
+    return {"org_id": current_user.org_id, "encryption_standard": "AES-256-GCM"}
+
+
+@router.post(
+    "/documents",
+    response_model=DocumentRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 @router.post(
     "/document-requests",
     response_model=DocumentRequestResponse,
@@ -38,6 +73,7 @@ async def create_document_request(
     ),
     db: AsyncSession = Depends(get_db_session),
 ) -> DocumentRequestModel:
+    await rate_limiter.check_rate_limit(current_user.org_id)
     repo = SQLDocumentRepository(db)
     audit_repo = AuditRepository(db)
 
@@ -58,6 +94,11 @@ async def create_document_request(
     return doc
 
 
+@router.post(
+    "/documents/{doc_id}/upload-url",
+    response_model=PresignedUploadResponse,
+    status_code=status.HTTP_200_OK,
+)
 @router.post(
     "/document-requests/{doc_id}/upload-url",
     response_model=PresignedUploadResponse,
@@ -144,18 +185,15 @@ async def upload_direct_encrypted_document(
             detail="File cannot be empty",
         )
 
-    # 1. Envelope Encrypt payload using per-tenant KEK and fresh DEK
     ciphertext, wrapped_dek, nonce, tag = crypto_vault.encrypt_document(
         org_id=doc.org_id,
         plaintext=raw_bytes,
     )
 
-    # 2. Persist encrypted bytes to isolated storage
     storage_filename = f"{doc.org_id}_{doc.id}.enc"
     storage_path = STORAGE_DIR / storage_filename
     storage_path.write_bytes(ciphertext)
 
-    # 3. Update database record with cryptographic metadata
     doc.file_name = file.filename
     doc.file_size_bytes = len(raw_bytes)
     doc.mime_type = file.content_type
@@ -265,6 +303,10 @@ async def download_decrypted_document(
 
 
 @router.get(
+    "/documents/{doc_id}/download-url",
+    status_code=status.HTTP_200_OK,
+)
+@router.get(
     "/document-requests/{doc_id}/download-url",
     status_code=status.HTTP_200_OK,
 )
@@ -313,6 +355,11 @@ async def get_presigned_download_url(
 
 
 @router.get(
+    "/documents/{doc_id}/audit-trail",
+    response_model=list[AuditEventResponse],
+    status_code=status.HTTP_200_OK,
+)
+@router.get(
     "/document-requests/{doc_id}/audit-trail",
     response_model=list[AuditEventResponse],
     status_code=status.HTTP_200_OK,
@@ -338,6 +385,11 @@ async def get_audit_trail(
     return [AuditEventResponse.model_validate(event) for event in events]
 
 
+@router.patch(
+    "/documents/{doc_id}/status",
+    response_model=DocumentRequestResponse,
+    status_code=status.HTTP_200_OK,
+)
 @router.patch(
     "/document-requests/{doc_id}/status",
     response_model=DocumentRequestResponse,
